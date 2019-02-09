@@ -309,14 +309,15 @@ module Make(C: S.CONFIGURATION with type 'a io = 'a Lwt.t) = struct
    * The buffer's data must fit in a single block. *)
   let write_already_locked nf ~size fillf =
     Shared_page_pool.use nf.t.tx_pool (fun ~id gref shared_block ->
-        fillf shared_block;
-        Stats.tx nf.t.stats (Int64.of_int size);
+        let len = 14 + fillf shared_block in
+        if len > size then failwith "length exceeds size" ;
+        Stats.tx nf.t.stats (Int64.of_int len);
         let request = { TX.Request.
           id;
           gref = Int32.of_int gref;
           offset = shared_block.Cstruct.off;
           flags = Flags.empty;
-          size
+          size = len
         } in
         Lwt_ring.Front.write nf.t.tx_client
           (fun slot -> TX.Request.write request slot; id) >>= fun replied ->
@@ -334,7 +335,7 @@ module Make(C: S.CONFIGURATION with type 'a io = 'a Lwt.t) = struct
 
   (* Transmit a packet from a list of pages *)
   let write_no_retry nf ~size fillf =
-    let size = size + 14 in
+    let size = 14 + size in
     let numneeded = Shared_page_pool.blocks_needed size in
     Lwt_mutex.with_lock nf.t.tx_mutex
       (fun () ->
@@ -346,11 +347,13 @@ module Make(C: S.CONFIGURATION with type 'a io = 'a Lwt.t) = struct
            write_already_locked nf ~size fillf
          | n ->
            let datav = Cstruct.create size in
-           fillf datav;
+           let len = 14 + fillf datav in
+           if len > size then failwith "length exceeds total size" ;
+           let datav = Cstruct.sub datav 0 len in
            (* For Xen Netfront, the first fragment contains the entire packet
             * length, which the backend will use to consume the remaining
             * fragments until the full length is satisfied *)
-           write_request ~flags:Flags.more_data ~size nf [datav]
+           write_request ~flags:Flags.more_data ~size:len nf [datav]
            >>= fun (datav, first_th) ->
            let rec xmit datav = function
              | 0 -> return []
@@ -372,7 +375,8 @@ module Make(C: S.CONFIGURATION with type 'a io = 'a Lwt.t) = struct
            return (Lwt.join (first_th :: rest_th))
       )
 
-  let rec write nf ~size fillf =
+  let rec write nf ?size fillf =
+    let size = match size with None -> nf.t.mtu | Some s -> s in
     if size > nf.t.mtu then
       Lwt.return (Error `Exceeds_mtu)
     else

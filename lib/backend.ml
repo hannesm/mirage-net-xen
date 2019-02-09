@@ -237,7 +237,8 @@ module Make(C: S.CONFIGURATION with type 'a io = 'a Lwt.t) = struct
       loop OS.Activations.program_start
     )
 
-  let write t ~size fillf =
+  let write t ?size fillf =
+    let size = match size with None -> t.mtu | Some s -> s in
     if size > t.mtu then
       Lwt.return (Error `Exceeds_mtu)
     else
@@ -253,16 +254,17 @@ module Make(C: S.CONFIGURATION with type 'a io = 'a Lwt.t) = struct
                  let gnt = {Gnt.Gnttab.domid = t.frontend_id; ref = Int32.to_int r.RX.Request.gref} in
                  let mapping = Gnt.Gnttab.map_exn gnttab gnt true in
                  let dst = Gnt.Gnttab.Local_mapping.to_buf mapping |> Io_page.to_cstruct in
-                 fillf dst;
+                 let len = 14 + fillf dst in
+                 if len > total_size then failwith "length exceeds total size" ;
                  Gnt.Gnttab.unmap_exn gnttab mapping;
                  let slot =
                    let ring = to_netfront t in
                    Ring.Rpc.Back.(slot ring (next_res_id ring)) in
-                 let size = Ok total_size in
+                 let size = Ok len in
                  let flags = Flags.empty in
                  let resp = { RX.Response.id = r.RX.Request.id; offset = 0; flags; size } in
                  RX.Response.write resp slot;
-                 Stats.tx t.stats (Int64.of_int total_size);
+                 Stats.tx t.stats (Int64.of_int len);
                  return ()
                | reqs ->
                  let rec fill_reqs ~src ~is_first = function
@@ -284,9 +286,11 @@ module Make(C: S.CONFIGURATION with type 'a io = 'a Lwt.t) = struct
                    | [] -> failwith "BUG: not enough pages for data!" in
                  (* TODO: find a smarter way to not need to copy around *)
                  let data = Cstruct.create size in
-                 fillf data;
-                 fill_reqs ~src:[data] ~is_first:true reqs;
-                 Stats.tx t.stats (Int64.of_int total_size);
+                 let len = 14 + fillf data in
+                 if len > total_size then failwith "length exceeds total size" ;
+                 let src = Cstruct.sub data 0 len in
+                 fill_reqs ~src:[src] ~is_first:true reqs;
+                 Stats.tx t.stats (Int64.of_int len);
                  return ()
              ) >|= fun () -> Ok (
            if Ring.Rpc.Back.push_responses_and_check_notify (to_netfront t)
